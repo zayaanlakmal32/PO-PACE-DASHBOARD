@@ -13,7 +13,7 @@
 //                   and the Content Board underneath it is covered too).
 //
 // Optional query params:
-//   ?client=Kavindu   - only scan one client, for testing/verification
+//   ?client=Kavindu   - only scan clients whose name contains this text (case-insensitive), for testing/verification
 //   ?days=5           - how many days ahead to scan for the heads-up tier (default 5)
 //
 // Every client's Content Board is a separately-built Notion database, and
@@ -217,8 +217,11 @@ module.exports = async (req, res) => {
       .filter((c) => c.clientName && !EXCLUDED_CLIENT_STAGES.has(c.stage));
 
     if (onlyClient) {
-  clients = clients.filter((c) => c.clientName.toLowerCase().includes(onlyClient));
-}
+      // Substring match (case-insensitive) so "lori" finds "Lori Greiner" -
+      // typing the full exact name was never required, it just looked that
+      // way because an earlier version needed an exact match.
+      clients = clients.filter((c) => c.clientName.toLowerCase().includes(onlyClient));
+    }
 
     const skipped = clients
       .filter((c) => !c.contentBoardDsId)
@@ -235,8 +238,11 @@ module.exports = async (req, res) => {
 
     const flags = [];
     const errors = [];
+    const scanned = [];
 
     for (const client of clients) {
+      let cardsChecked = 0;
+      let flaggedCount = 0;
       try {
         const schema = await getBoardSchema(token, client.contentBoardDsId);
         const dateProp = await resolveDateProp(token, client.contentBoardDsId, schema);
@@ -252,6 +258,7 @@ module.exports = async (req, res) => {
           },
           sorts: [{ property: dateProp, direction: "ascending" }],
         });
+        cardsChecked = cards.length;
 
         for (const card of cards) {
           const name = getTitle(card, schema.titleProp);
@@ -274,6 +281,7 @@ module.exports = async (req, res) => {
           }
 
           if (flag) {
+            flaggedCount++;
             flags.push({
               po: client.poName || "Unassigned",
               client: client.clientName,
@@ -286,10 +294,27 @@ module.exports = async (req, res) => {
             });
           }
         }
+
+        scanned.push({
+          client: client.clientName,
+          po: client.poName || "Unassigned",
+          cardsChecked,
+          flaggedCount,
+          error: null,
+        });
       } catch (e) {
         errors.push({ client: client.clientName, error: e.message });
+        scanned.push({
+          client: client.clientName,
+          po: client.poName || "Unassigned",
+          cardsChecked,
+          flaggedCount,
+          error: e.message,
+        });
       }
     }
+
+    scanned.sort((a, b) => a.client.localeCompare(b.client));
 
     flags.sort((a, b) => {
       if (a.flag !== b.flag) return a.flag === "hard" ? -1 : 1;
@@ -304,6 +329,7 @@ module.exports = async (req, res) => {
       flags,
       skipped,
       errors,
+      scanned,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
