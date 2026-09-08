@@ -105,12 +105,33 @@
     text-align: center;
     font-size: 14px;
   }
-  .errors, .skipped {
+  .errors, .skipped, .scanlist {
     margin-top: 24px;
     font-size: 12.5px;
     color: var(--muted);
   }
-  .errors summary, .skipped summary { cursor: pointer; }
+  .errors summary, .skipped summary, .scanlist summary { cursor: pointer; }
+  table.scan-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    font-size: 12.5px;
+  }
+  table.scan-table th, table.scan-table td {
+    text-align: left;
+    padding: 5px 8px;
+    border-top: 1px solid #1f232c;
+  }
+  table.scan-table th {
+    color: var(--muted);
+    font-weight: 600;
+  }
+  table.scan-table tr.row-error td { color: var(--hard); }
+  table.scan-table tr.row-flagged td:first-child { color: var(--soft); }
+  .scan-table .icon { width: 18px; }
+  #scanFilter {
+    margin-top: 8px;
+  }
 </style>
 </head>
 <body>
@@ -123,7 +144,7 @@
 <div class="toolbar">
   <button class="primary" id="refreshBtn">Refresh</button>
   <button id="copyAllBtn">Copy full list for Slack</button>
-  <label class="meta">Test single client: <input type="text" id="clientFilter" placeholder="e.g. Kavindu" size="14"/></label>
+  <label class="meta">Test single client (matches any part of the name): <input type="text" id="clientFilter" placeholder="e.g. lori" size="14"/></label>
   <label class="meta">Lookahead days: <input type="number" id="daysInput" value="5" min="1" max="14" size="3"/></label>
 </div>
 
@@ -237,6 +258,16 @@ function render(data) {
     data.errors.forEach((e) => (extra += `<li>${e.client} — ${e.error}</li>`));
     extra += `</ul></details>`;
   }
+  if (data.scanned && data.scanned.length) {
+    extra += `<details class="scanlist"><summary>Full scan results — every active client checked (${data.scanned.length})</summary>`;
+    extra += `<table class="scan-table"><thead><tr><th class="icon"></th><th>Client</th><th>PO</th><th>Cards checked</th><th>Flagged</th><th>Notes</th></tr></thead><tbody>`;
+    data.scanned.forEach((s) => {
+      const icon = s.error ? "❌" : s.flaggedCount > 0 ? "⚠️" : "✅";
+      const rowClass = s.error ? "row-error" : s.flaggedCount > 0 ? "row-flagged" : "";
+      extra += `<tr class="${rowClass}"><td class="icon">${icon}</td><td>${s.client}</td><td>${s.po}</td><td>${s.cardsChecked}</td><td>${s.flaggedCount}</td><td>${s.error || ""}</td></tr>`;
+    });
+    extra += `</tbody></table></details>`;
+  }
   contentEl.innerHTML += extra;
 }
 
@@ -275,4 +306,3 @@ load();
 
 </body>
 </html>
-
