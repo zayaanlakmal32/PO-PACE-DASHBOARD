@@ -16,36 +16,62 @@
 //   ?client=Kavindu   - only scan one client, for testing/verification
 //   ?days=5           - how many days ahead to scan for the heads-up tier (default 5)
 //
-// Not every client's Content Board uses the same template. Accelerate boards
-// use "Publish Date" / "Need writing" / "Need posting" style names; some DFY
-// boards use "Publishing date" / "Ready to write" / "To be published" style
-// names instead. Rather than hardcoding one schema, this file:
-//   1. tries a short list of known date-property names per client, and
-//   2. matches statuses by a case-insensitive phrase lookup instead of an
-//      exact list, so both templates (and small variations) are covered.
+// Every client's Content Board is a separately-built Notion database, and
+// several (mostly DFY clients) use completely custom Status vocabularies -
+// e.g. one board's "done" status is literally called "Done", another calls
+// its client-review stage "DL's review". Rather than hardcoding status
+// names, this file reads each board's OWN Notion "Complete" status group
+// (already configured by whoever built that board) to know which statuses
+// mean "nothing left to do here" - plus a couple of small curated
+// additions ("Client Review" and "<Name>'s review" style stages, which
+// Notion doesn't mark Complete but the pace rule treats as fine) and a
+// best-effort phrase list for the "still early stage" heads-up tier.
 
 const NOTION_VERSION = "2025-09-03"; // multi-data-source API
 const PROJECT_TRACKER_DS = "b6b396fe-f0cf-4d7e-9845-e18c630c0ae7";
 
-// Known Publish-Date property name variants, tried in order.
-const DATE_PROP_CANDIDATES = ["Publish Date", "Publishing date", "Publish date", "Publication Date"];
+// Fallback date-property name candidates, used only if a board's schema
+// doesn't have an obviously-named "...publish..." date property.
+const DATE_PROP_FALLBACKS = ["Publish Date", "Publishing date", "Publish date", "Publication Date"];
 
-// Case-insensitive status phrase matching (covers multiple board templates).
-const HARD_OK_MATCH = new Set(["client review", "need posting", "published", "to be published", "ready to post", "ready to publish"]);
-const IGNORE_MATCH = new Set(["published", "on hold", "do not progress"]);
+// Always treated as "nothing left for the PO to do", regardless of what a
+// given board's own Notion status groups say.
+const STATIC_SAFE_MATCH = new Set(["client review", "on hold", "do not progress", "do not progress "]);
+
+// Best-effort "still early stage" phrase list for the softer heads-up tier.
+// Every variant actually seen across Accelerate + DFY boards so far.
 const EARLY_STAGE_MATCH = new Set([
   "topics",
   "ideas",
   "ideas approved",
   "need writing",
+  "needs writing",
   "ready to write",
   "writing",
   "writing review",
   "need filming",
+  "needs filming",
   "ready to film",
 ]);
 
 const EXCLUDED_CLIENT_STAGES = new Set(["On Hold", "Offboarded"]);
+
+async function notionGet(token, path) {
+  const resp = await fetch(`https://api.notion.com${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Notion-Version": NOTION_VERSION,
+    },
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    const err = new Error(`Notion GET failed (${resp.status}): ${text.slice(0, 300)}`);
+    err.status = resp.status;
+    err.body = text;
+    throw err;
+  }
+  return resp.json();
+}
 
 async function notionQuery(token, dataSourceId, body) {
   const resp = await fetch(`https://api.notion.com/v1/data_sources/${dataSourceId}/query`, {
@@ -79,36 +105,72 @@ async function queryAllPages(token, dataSourceId, body) {
   return results;
 }
 
-// Tries each candidate date-property name until one works. Stops immediately
-// (no wasted retries) on errors that aren't about a missing property, e.g. a
-// 404 because the board isn't shared with the integration.
-async function queryClientCards(token, dataSourceId, todayStr, windowEndStr) {
-  let lastErr;
-  for (const dateProp of DATE_PROP_CANDIDATES) {
+// Reads a board's own property schema: which property is the title, which
+// is the Status, which date property is "publish date", and - crucially -
+// that board's own Notion "Complete" status group (its own definition of
+// "done"), so we never have to guess a board's status vocabulary.
+async function getBoardSchema(token, dataSourceId) {
+  const ds = await notionGet(token, `/v1/data_sources/${dataSourceId}`);
+  const props = ds.properties || {};
+
+  let titleProp = null;
+  let statusProp = null;
+  let dateProp = null;
+  const safeStatuses = new Set();
+
+  for (const [name, def] of Object.entries(props)) {
+    if (def.type === "title" && !titleProp) titleProp = name;
+    if (def.type === "status" && !statusProp) {
+      statusProp = name;
+      const options = def.status?.options || [];
+      const groups = def.status?.groups || [];
+      const idToName = new Map(options.map((o) => [o.id, o.name]));
+      for (const g of groups) {
+        if (/complete/i.test(g.name || "")) {
+          for (const optId of g.option_ids || []) {
+            const optName = idToName.get(optId);
+            if (optName) safeStatuses.add(optName.trim().toLowerCase());
+          }
+        }
+      }
+    }
+    if (def.type === "date" && !dateProp && /publish/i.test(name)) dateProp = name;
+  }
+
+  if (!titleProp) titleProp = "Name";
+  return { titleProp, statusProp, dateProp, safeStatuses };
+}
+
+// Falls back to trying known date-property name variants if schema-based
+// detection didn't find an obviously-named one.
+async function resolveDateProp(token, dataSourceId, schema) {
+  if (schema.dateProp) return schema.dateProp;
+  for (const candidate of DATE_PROP_FALLBACKS) {
     try {
-      const cards = await queryAllPages(token, dataSourceId, {
-        filter: {
-          and: [
-            { property: dateProp, date: { on_or_after: todayStr } },
-            { property: dateProp, date: { on_or_before: windowEndStr } },
-          ],
-        },
-        sorts: [{ property: dateProp, direction: "ascending" }],
+      await queryAllPages(token, dataSourceId, {
+        filter: { property: candidate, date: { is_not_empty: true } },
+        page_size: 1,
       });
-      return { cards, dateProp };
+      return candidate;
     } catch (e) {
-      lastErr = e;
-      const isPropertyIssue = e.status === 400 && /property/i.test(e.body || "");
-      if (!isPropertyIssue) throw e; // e.g. 404 not shared - retrying with another name won't help
+      // try next candidate
     }
   }
-  throw lastErr;
+  return null;
 }
 
 function getTitle(page, propName) {
   const prop = page.properties?.[propName];
   if (!prop?.title) return "";
   return prop.title.map((t) => t.plain_text).join("");
+}
+function getStatus(page, propName) {
+  const prop = page.properties?.[propName];
+  return prop?.status ? prop.status.name : null;
+}
+function getDate(page, propName) {
+  const prop = page.properties?.[propName];
+  return prop?.date ? prop.date.start : null;
 }
 function getRichText(page, propName) {
   const prop = page.properties?.[propName];
@@ -119,17 +181,16 @@ function getSelect(page, propName) {
   const prop = page.properties?.[propName];
   return prop?.select ? prop.select.name : null;
 }
-function getStatus(page, propName) {
-  const prop = page.properties?.[propName];
-  return prop?.status ? prop.status.name : null;
-}
-function getDate(page, propName) {
-  const prop = page.properties?.[propName];
-  return prop?.date ? prop.date.start : null;
-}
 
 function isoDateOnly(d) {
   return d.toISOString().slice(0, 10);
+}
+
+function isSafeStatus(statusKey, boardSafeStatuses) {
+  if (boardSafeStatuses.has(statusKey)) return true;
+  if (STATIC_SAFE_MATCH.has(statusKey)) return true;
+  if (/'s review$/.test(statusKey)) return true; // e.g. "DL's review"
+  return false;
 }
 
 module.exports = async (req, res) => {
@@ -177,23 +238,36 @@ module.exports = async (req, res) => {
 
     for (const client of clients) {
       try {
-        const { cards, dateProp } = await queryClientCards(token, client.contentBoardDsId, todayStr, windowEndStr);
+        const schema = await getBoardSchema(token, client.contentBoardDsId);
+        const dateProp = await resolveDateProp(token, client.contentBoardDsId, schema);
+        if (!dateProp) throw new Error(`Couldn't find a "publish date" style date property on this board.`);
+        if (!schema.statusProp) throw new Error(`Couldn't find a Status property on this board.`);
+
+        const cards = await queryAllPages(token, client.contentBoardDsId, {
+          filter: {
+            and: [
+              { property: dateProp, date: { on_or_after: todayStr } },
+              { property: dateProp, date: { on_or_before: windowEndStr } },
+            ],
+          },
+          sorts: [{ property: dateProp, direction: "ascending" }],
+        });
 
         for (const card of cards) {
-          const name = getTitle(card, "Name");
-          const status = getStatus(card, "Status");
+          const name = getTitle(card, schema.titleProp);
+          const status = getStatus(card, schema.statusProp);
           const publishDate = getDate(card, dateProp);
           if (!publishDate || !status) continue;
 
           const statusKey = status.trim().toLowerCase();
-          if (IGNORE_MATCH.has(statusKey)) continue;
+          if (isSafeStatus(statusKey, schema.safeStatuses)) continue;
 
           const daysUntil = Math.round(
             (new Date(publishDate + "T00:00:00Z") - new Date(todayStr + "T00:00:00Z")) / 86400000
           );
 
           let flag = null;
-          if (daysUntil <= 1 && !HARD_OK_MATCH.has(statusKey)) {
+          if (daysUntil <= 1) {
             flag = "hard";
           } else if (daysUntil >= 2 && EARLY_STAGE_MATCH.has(statusKey)) {
             flag = "soft";
