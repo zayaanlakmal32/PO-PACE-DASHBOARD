@@ -1,0 +1,9 @@
+{
+  "name": "editoz-po-pace-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Flags Content Board cards that are behind the 24hr-before-publish PO pace rule, across all active Editoz Club clients.",
+  "engines": {
+    "node": ">=18"
+  }
+}
