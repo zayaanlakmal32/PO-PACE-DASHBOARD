@@ -217,8 +217,8 @@ module.exports = async (req, res) => {
       .filter((c) => c.clientName && !EXCLUDED_CLIENT_STAGES.has(c.stage));
 
     if (onlyClient) {
-      clients = clients.filter((c) => c.clientName.toLowerCase() === onlyClient);
-    }
+  clients = clients.filter((c) => c.clientName.toLowerCase().includes(onlyClient));
+}
 
     const skipped = clients
       .filter((c) => !c.contentBoardDsId)
