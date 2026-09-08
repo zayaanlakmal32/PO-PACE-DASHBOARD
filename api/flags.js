@@ -7,26 +7,44 @@
 // Env vars required (set in Vercel Project Settings -> Environment Variables):
 //   NOTION_TOKEN  - same Notion integration token used by the other Editoz
 //                   dashboards. It must be shared with the Project Tracker
-//                   AND with every client's Content Board (usually inherited
-//                   automatically since they live under one shared workspace
-//                   tree, but worth checking if a client comes back "not found").
+//                   AND with every client's Content Board page (Notion
+//                   integrations only see pages explicitly shared with them
+//                   - share the client's "Content Production Engine" page
+//                   and the Content Board underneath it is covered too).
 //
 // Optional query params:
 //   ?client=Kavindu   - only scan one client, for testing/verification
 //   ?days=5           - how many days ahead to scan for the heads-up tier (default 5)
+//
+// Not every client's Content Board uses the same template. Accelerate boards
+// use "Publish Date" / "Need writing" / "Need posting" style names; some DFY
+// boards use "Publishing date" / "Ready to write" / "To be published" style
+// names instead. Rather than hardcoding one schema, this file:
+//   1. tries a short list of known date-property names per client, and
+//   2. matches statuses by a case-insensitive phrase lookup instead of an
+//      exact list, so both templates (and small variations) are covered.
 
 const NOTION_VERSION = "2025-09-03"; // multi-data-source API
 const PROJECT_TRACKER_DS = "b6b396fe-f0cf-4d7e-9845-e18c630c0ae7";
 
-const HARD_OK_STATUSES = new Set(["Client Review", "Need posting", "PUBLISHED"]);
-const IGNORE_STATUSES = new Set(["PUBLISHED", "On Hold", "Do Not Progress"]);
-const EARLY_STAGE_STATUSES = new Set([
-  "Topics",
-  "Need writing",
-  "Writing",
-  "Writing Review",
-  "Need filming",
+// Known Publish-Date property name variants, tried in order.
+const DATE_PROP_CANDIDATES = ["Publish Date", "Publishing date", "Publish date", "Publication Date"];
+
+// Case-insensitive status phrase matching (covers multiple board templates).
+const HARD_OK_MATCH = new Set(["client review", "need posting", "published", "to be published", "ready to post", "ready to publish"]);
+const IGNORE_MATCH = new Set(["published", "on hold", "do not progress"]);
+const EARLY_STAGE_MATCH = new Set([
+  "topics",
+  "ideas",
+  "ideas approved",
+  "need writing",
+  "ready to write",
+  "writing",
+  "writing review",
+  "need filming",
+  "ready to film",
 ]);
+
 const EXCLUDED_CLIENT_STAGES = new Set(["On Hold", "Offboarded"]);
 
 async function notionQuery(token, dataSourceId, body) {
@@ -41,7 +59,10 @@ async function notionQuery(token, dataSourceId, body) {
   });
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(`Notion query failed (${resp.status}): ${text.slice(0, 300)}`);
+    const err = new Error(`Notion query failed (${resp.status}): ${text.slice(0, 300)}`);
+    err.status = resp.status;
+    err.body = text;
+    throw err;
   }
   return resp.json();
 }
@@ -56,6 +77,32 @@ async function queryAllPages(token, dataSourceId, body) {
     cursor = data.has_more ? data.next_cursor : undefined;
   } while (cursor);
   return results;
+}
+
+// Tries each candidate date-property name until one works. Stops immediately
+// (no wasted retries) on errors that aren't about a missing property, e.g. a
+// 404 because the board isn't shared with the integration.
+async function queryClientCards(token, dataSourceId, todayStr, windowEndStr) {
+  let lastErr;
+  for (const dateProp of DATE_PROP_CANDIDATES) {
+    try {
+      const cards = await queryAllPages(token, dataSourceId, {
+        filter: {
+          and: [
+            { property: dateProp, date: { on_or_after: todayStr } },
+            { property: dateProp, date: { on_or_before: windowEndStr } },
+          ],
+        },
+        sorts: [{ property: dateProp, direction: "ascending" }],
+      });
+      return { cards, dateProp };
+    } catch (e) {
+      lastErr = e;
+      const isPropertyIssue = e.status === 400 && /property/i.test(e.body || "");
+      if (!isPropertyIssue) throw e; // e.g. 404 not shared - retrying with another name won't help
+    }
+  }
+  throw lastErr;
 }
 
 function getTitle(page, propName) {
@@ -130,30 +177,25 @@ module.exports = async (req, res) => {
 
     for (const client of clients) {
       try {
-        const cards = await queryAllPages(token, client.contentBoardDsId, {
-          filter: {
-            and: [
-              { property: "Publish Date", date: { on_or_after: todayStr } },
-              { property: "Publish Date", date: { on_or_before: windowEndStr } },
-            ],
-          },
-          sorts: [{ property: "Publish Date", direction: "ascending" }],
-        });
+        const { cards, dateProp } = await queryClientCards(token, client.contentBoardDsId, todayStr, windowEndStr);
 
         for (const card of cards) {
           const name = getTitle(card, "Name");
           const status = getStatus(card, "Status");
-          const publishDate = getDate(card, "Publish Date");
-          if (!publishDate || !status || IGNORE_STATUSES.has(status)) continue;
+          const publishDate = getDate(card, dateProp);
+          if (!publishDate || !status) continue;
+
+          const statusKey = status.trim().toLowerCase();
+          if (IGNORE_MATCH.has(statusKey)) continue;
 
           const daysUntil = Math.round(
             (new Date(publishDate + "T00:00:00Z") - new Date(todayStr + "T00:00:00Z")) / 86400000
           );
 
           let flag = null;
-          if (daysUntil <= 1 && !HARD_OK_STATUSES.has(status)) {
+          if (daysUntil <= 1 && !HARD_OK_MATCH.has(statusKey)) {
             flag = "hard";
-          } else if (daysUntil >= 2 && EARLY_STAGE_STATUSES.has(status)) {
+          } else if (daysUntil >= 2 && EARLY_STAGE_MATCH.has(statusKey)) {
             flag = "soft";
           }
 
