@@ -1,1 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PO Pace Flags — Editoz Club</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-border: #262b36;
+    --text: #e7e9ee;
+    --muted: #8b93a3;
+    --hard: #ff6b6b;
+    --soft: #ffd166;
+    --ok: #51cf66;
+    --link: #7aa2f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 24px;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .toolbar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  button {
+    background: #232838;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { background: #2b3145; }
+  button.primary { background: #3557ea; border-color: #3557ea; }
+  button.primary:hover { background: #4566f5; }
+  input[type="text"], input[type="number"] {
+    background: #0c0e12;
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
+  #status { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .po-group {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 16px;
+  }
+  .po-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .po-name { font-weight: 600; font-size: 15px; }
+  .po-count { color: var(--muted); font-size: 12px; }
+  .client-block { margin-top: 10px; }
+  .client-name { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+  ul.cards { list-style: none; margin: 0 0 4px 0; padding: 0; }
+  li.card {
+    padding: 6px 0;
+    font-size: 13.5px;
+    line-height: 1.5;
+    border-top: 1px solid #1f232c;
+  }
+  li.card:first-child { border-top: none; }
+  .flag-hard { color: var(--hard); }
+  .flag-soft { color: var(--soft); }
+  a { color: var(--link); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .status-tag {
+    display: inline-block;
+    background: #232838;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .empty {
+    color: var(--muted);
+    padding: 40px 0;
+    text-align: center;
+    font-size: 14px;
+  }
+  .errors, .skipped {
+    margin-top: 24px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .errors summary, .skipped summary { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>PO Pace Flags</h1>
+  <div class="meta" id="meta">loading…</div>
+</header>
+
+<div class="toolbar">
+  <button class="primary" id="refreshBtn">Refresh</button>
+  <button id="copyAllBtn">Copy full list for Slack</button>
+  <label class="meta">Test single client: <input type="text" id="clientFilter" placeholder="e.g. Kavindu" size="14"/></label>
+  <label class="meta">Lookahead days: <input type="number" id="daysInput" value="5" min="1" max="14" size="3"/></label>
+</div>
+
+<div id="status"></div>
+<div id="content"></div>
+
+<script>
+const contentEl = document.getElementById("content");
+const statusEl = document.getElementById("status");
+const metaEl = document.getElementById("meta");
+let lastFlags = [];
+
+function fmtDate(dateStr) {
+  const d = new Date(dateStr + "T00:00:00Z");
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+}
+
+function cardLine(f, forSlack) {
+  const icon = f.flag === "hard" ? "⚠️" : "👀";
+  const link = forSlack ? `<${f.cardUrl}|${f.cardName}>` : `<a href="${f.cardUrl}" target="_blank" rel="noopener">${f.cardName}</a>`;
+  let when, note;
+  if (f.daysUntil <= 0) {
+    when = `publishes today (${fmtDate(f.publishDate)})`;
+    const yesterday = new Date(new Date(f.publishDate + "T00:00:00Z").getTime() - 86400000).toISOString().slice(0,10);
+    note = `still "${f.status}" (should've hit "Need posting" by ${fmtDate(yesterday)})`;
+  } else if (f.daysUntil === 1) {
+    when = `publishes tomorrow (${fmtDate(f.publishDate)})`;
+    note = `still "${f.status}" (should be "Need posting" as of today)`;
+  } else {
+    when = `publishes ${fmtDate(f.publishDate)}`;
+    note = `still "${f.status}" — heads-up, behind pace, follow up to speed up`;
+  }
+  return `${icon} ${link} — ${when}, ${note}`;
+}
+
+function groupFlags(flags) {
+  const byPo = {};
+  for (const f of flags) {
+    byPo[f.po] = byPo[f.po] || {};
+    byPo[f.po][f.client] = byPo[f.po][f.client] || [];
+    byPo[f.po][f.client].push(f);
+  }
+  return byPo;
+}
+
+function buildSlackText(byPo, poFilter) {
+  const lines = [];
+  const poNames = poFilter ? [poFilter] : Object.keys(byPo).sort();
+  for (const po of poNames) {
+    const clients = byPo[po];
+    if (!clients) continue;
+    lines.push(po);
+    for (const client of Object.keys(clients)) {
+      lines.push(`Client: ${client}`);
+      lines.push("");
+      for (const f of clients[client]) {
+        lines.push(`• ${cardLine(f, true)}`);
+      }
+      lines.push("");
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+function render(data) {
+  lastFlags = data.flags || [];
+  metaEl.textContent = `generated ${new Date(data.generatedAt).toLocaleString()} · scanned ${data.clientsScanned} active client(s) · window ${data.windowDays}d`;
+
+  if (!lastFlags.length) {
+    contentEl.innerHTML = '<div class="empty">No flagged cards right now 🎉</div>';
+  } else {
+    const byPo = groupFlags(lastFlags);
+    let html = "";
+    for (const po of Object.keys(byPo).sort()) {
+      const clients = byPo[po];
+      const total = Object.values(clients).reduce((n, arr) => n + arr.length, 0);
+      html += `<div class="po-group" data-po="${po}">`;
+      html += `<div class="po-header"><span class="po-name">${po}</span>`;
+      html += `<span><span class="po-count">${total} flagged</span> <button class="copyPoBtn" data-po="${po}">Copy</button></span></div>`;
+      for (const client of Object.keys(clients)) {
+        html += `<div class="client-block"><div class="client-name">Client: ${client}</div><ul class="cards">`;
+        for (const f of clients[client]) {
+          html += `<li class="card flag-${f.flag}">${cardLine(f, false)} <span class="status-tag">${f.status}</span></li>`;
+        }
+        html += `</ul></div>`;
+      }
+      html += `</div>`;
+    }
+    contentEl.innerHTML = html;
+
+    document.querySelectorAll(".copyPoBtn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const po = btn.dataset.po;
+        const text = buildSlackText(groupFlags(lastFlags), po);
+        navigator.clipboard.writeText(text).then(() => {
+          btn.textContent = "Copied!";
+          setTimeout(() => (btn.textContent = "Copy"), 1200);
+        });
+      });
+    });
+  }
+
+  let extra = "";
+  if (data.skipped && data.skipped.length) {
+    extra += `<details class="skipped"><summary>${data.skipped.length} client(s) skipped (no Content Board Data Source ID)</summary><ul>`;
+    data.skipped.forEach((s) => (extra += `<li>${s.client} — ${s.reason}</li>`));
+    extra += `</ul></details>`;
+  }
+  if (data.errors && data.errors.length) {
+    extra += `<details class="errors"><summary>${data.errors.length} client(s) errored while scanning</summary><ul>`;
+    data.errors.forEach((e) => (extra += `<li>${e.client} — ${e.error}</li>`));
+    extra += `</ul></details>`;
+  }
+  contentEl.innerHTML += extra;
+}
+
+async function load() {
+  statusEl.textContent = "Scanning Notion…";
+  contentEl.innerHTML = "";
+  const client = document.getElementById("clientFilter").value.trim();
+  const days = document.getElementById("daysInput").value.trim();
+  const params = new URLSearchParams();
+  if (client) params.set("client", client);
+  if (days) params.set("days", days);
+  try {
+    const res = await fetch("/api/flags?" + params.toString());
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Unknown error");
+    statusEl.textContent = "";
+    render(data);
+  } catch (e) {
+    statusEl.textContent = "";
+    contentEl.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+document.getElementById("refreshBtn").addEventListener("click", load);
+document.getElementById("copyAllBtn").addEventListener("click", () => {
+  const text = buildSlackText(groupFlags(lastFlags));
+  navigator.clipboard.writeText(text || "Nothing flagged right now.").then(() => {
+    const btn = document.getElementById("copyAllBtn");
+    btn.textContent = "Copied!";
+    setTimeout(() => (btn.textContent = "Copy full list for Slack"), 1200);
+  });
+});
+
+load();
+</script>
+
+</body>
+</html>
 
