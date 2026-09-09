@@ -1,19 +1,30 @@
 // api/flags.js
 //
 // Scans every active client's Content Board (via the Project Tracker) and
-// flags cards that are behind the "PO must keep the next post ready 24hrs
-// before publish" rule.
+// flags cards that are behind pace - i.e. not ready for client review by
+// each client's own required lead time before their Publish Date.
+//
+// That lead time comes from the "Client Posting Cadence & Non-Negotiables"
+// Google Sheet POs fill in (see api/_lib/cadence.js) - a client with a row
+// there uses their own number (e.g. "2 days before"); a client with no row,
+// or an unparseable one, falls back to the original flat 24hr rule.
 //
 // Env vars required (set in Vercel Project Settings -> Environment Variables):
-//   NOTION_TOKEN  - same Notion integration token used by the other Editoz
-//                   dashboards. It must be shared with the Project Tracker
-//                   AND with every client's Content Board page (Notion
-//                   integrations only see pages explicitly shared with them
-//                   - share the client's "Content Production Engine" page
-//                   and the Content Board underneath it is covered too).
+//   NOTION_TOKEN         - same Notion integration token used by the other
+//                          Editoz dashboards. It must be shared with the
+//                          Project Tracker AND with every client's Content
+//                          Board page (Notion integrations only see pages
+//                          explicitly shared with them - share the client's
+//                          "Content Production Engine" page and the Content
+//                          Board underneath it is covered too).
+//   GOOGLE_SHEETS_API_KEY - a Google Cloud API key restricted to the Sheets
+//                          API, used to read the cadence sheet. Optional -
+//                          if unset, every client just uses the flat 24hr
+//                          default (nothing breaks, cadenceStatus.connected
+//                          will just read false in the response).
 //
 // Optional query params:
-//   ?client=Kavindu   - only scan clients whose name contains this text (case-insensitive), for testing/verification
+//   ?client=Kavindu   - only scan clients whose name contains this text (case-insensitive)
 //   ?days=5           - how many days ahead to scan for the heads-up tier (default 5)
 //
 // Every client's Content Board is a separately-built Notion database, and
@@ -26,6 +37,8 @@
 // additions ("Client Review" and "<Name>'s review" style stages, which
 // Notion doesn't mark Complete but the pace rule treats as fine) and a
 // best-effort phrase list for the "still early stage" heads-up tier.
+
+const { getCadenceMap, DEFAULT_LEAD_DAYS } = require("./_lib/cadence");
 
 const NOTION_VERSION = "2025-09-03"; // multi-data-source API
 const PROJECT_TRACKER_DS = "b6b396fe-f0cf-4d7e-9845-e18c630c0ae7";
@@ -204,8 +217,12 @@ module.exports = async (req, res) => {
   const windowDays = Math.max(1, Math.min(14, parseInt(req.query?.days, 10) || 5));
 
   try {
-    // 1. Active clients from Project Tracker
-    const trackerRows = await queryAllPages(token, PROJECT_TRACKER_DS, {});
+    // 1. Active clients from Project Tracker, and each client's own review
+    // lead time from the cadence sheet (in parallel - independent reads).
+    const [trackerRows, cadence] = await Promise.all([
+      queryAllPages(token, PROJECT_TRACKER_DS, {}),
+      getCadenceMap(),
+    ]);
 
     let clients = trackerRows
       .map((row) => ({
@@ -243,6 +260,23 @@ module.exports = async (req, res) => {
     for (const client of clients) {
       let cardsChecked = 0;
       let flaggedCount = 0;
+
+      // This client's own review lead time from the cadence sheet, if they
+      // have a row there and it could be confidently parsed. Otherwise fall
+      // back to the original flat rule so nothing goes unmonitored just
+      // because a PO hasn't filled in the sheet yet.
+      const cadenceEntry = cadence.map.get(client.clientName.toLowerCase());
+      let leadDays = DEFAULT_LEAD_DAYS;
+      let cadenceSource = "default (no row in cadence sheet)";
+      if (cadenceEntry) {
+        if (cadenceEntry.leadDays != null) {
+          leadDays = cadenceEntry.leadDays;
+          cadenceSource = `sheet: ${leadDays} day${leadDays === 1 ? "" : "s"} before ("${cadenceEntry.readyByText}")`;
+        } else {
+          cadenceSource = `default - couldn't read "${cadenceEntry.readyByText}"`;
+        }
+      }
+
       try {
         const schema = await getBoardSchema(token, client.contentBoardDsId);
         const dateProp = await resolveDateProp(token, client.contentBoardDsId, schema);
@@ -274,9 +308,9 @@ module.exports = async (req, res) => {
           );
 
           let flag = null;
-          if (daysUntil <= 1) {
+          if (daysUntil <= leadDays) {
             flag = "hard";
-          } else if (daysUntil >= 2 && EARLY_STAGE_MATCH.has(statusKey)) {
+          } else if (EARLY_STAGE_MATCH.has(statusKey)) {
             flag = "soft";
           }
 
@@ -290,6 +324,8 @@ module.exports = async (req, res) => {
               status,
               publishDate,
               daysUntil,
+              leadDays,
+              cadenceSource,
               flag,
             });
           }
@@ -300,6 +336,8 @@ module.exports = async (req, res) => {
           po: client.poName || "Unassigned",
           cardsChecked,
           flaggedCount,
+          leadDays,
+          cadenceSource,
           error: null,
         });
       } catch (e) {
@@ -309,6 +347,8 @@ module.exports = async (req, res) => {
           po: client.poName || "Unassigned",
           cardsChecked,
           flaggedCount,
+          leadDays,
+          cadenceSource,
           error: e.message,
         });
       }
@@ -330,6 +370,11 @@ module.exports = async (req, res) => {
       skipped,
       errors,
       scanned,
+      cadenceStatus: {
+        connected: cadence.ok,
+        error: cadence.error,
+        rowCount: cadence.ok ? cadence.rowCount : undefined,
+      },
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
