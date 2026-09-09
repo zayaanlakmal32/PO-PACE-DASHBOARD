@@ -132,6 +132,15 @@
   #scanFilter {
     margin-top: 8px;
   }
+  .cadence-banner {
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12.5px;
+    margin-bottom: 16px;
+    border: 1px solid var(--panel-border);
+  }
+  .cadence-ok { color: var(--ok); border-color: #24422c; background: #12291a; }
+  .cadence-off { color: var(--soft); border-color: #4a3c14; background: #241d0c; }
 </style>
 </head>
 <body>
@@ -165,14 +174,16 @@ function fmtDate(dateStr) {
 function cardLine(f, forSlack) {
   const icon = f.flag === "hard" ? "⚠️" : "👀";
   const link = forSlack ? `<${f.cardUrl}|${f.cardName}>` : `<a href="${f.cardUrl}" target="_blank" rel="noopener">${f.cardName}</a>`;
+  const leadDays = f.leadDays == null ? 1 : f.leadDays;
+  const deadline = new Date(new Date(f.publishDate + "T00:00:00Z").getTime() - leadDays * 86400000).toISOString().slice(0, 10);
+  const windowLabel = `${leadDays}-day review window`;
   let when, note;
   if (f.daysUntil <= 0) {
     when = `publishes today (${fmtDate(f.publishDate)})`;
-    const yesterday = new Date(new Date(f.publishDate + "T00:00:00Z").getTime() - 86400000).toISOString().slice(0,10);
-    note = `still "${f.status}" (should've hit "Need posting" by ${fmtDate(yesterday)})`;
-  } else if (f.daysUntil === 1) {
-    when = `publishes tomorrow (${fmtDate(f.publishDate)})`;
-    note = `still "${f.status}" (should be "Need posting" as of today)`;
+    note = `still "${f.status}" (should've been ready for client review by ${fmtDate(deadline)} — ${windowLabel})`;
+  } else if (f.daysUntil <= leadDays) {
+    when = `publishes ${fmtDate(f.publishDate)}`;
+    note = `still "${f.status}" (should be ready for client review as of today — ${windowLabel})`;
   } else {
     when = `publishes ${fmtDate(f.publishDate)}`;
     note = `still "${f.status}" — heads-up, behind pace, follow up to speed up`;
@@ -209,12 +220,22 @@ function buildSlackText(byPo, poFilter) {
   return lines.join("\n").trim();
 }
 
+function cadenceBanner(status) {
+  if (!status) return "";
+  if (status.connected) {
+    return `<div class="cadence-banner cadence-ok">✅ Cadence sheet connected — ${status.rowCount} client row(s) read. Clients not listed there use the default 24hr rule.</div>`;
+  }
+  return `<div class="cadence-banner cadence-off">⚠️ Cadence sheet not connected (${status.error || "unknown reason"}) — every client is using the default 24hr rule right now.</div>`;
+}
+
 function render(data) {
   lastFlags = data.flags || [];
   metaEl.textContent = `generated ${new Date(data.generatedAt).toLocaleString()} · scanned ${data.clientsScanned} active client(s) · window ${data.windowDays}d`;
 
+  const bannerHtml = cadenceBanner(data.cadenceStatus);
+
   if (!lastFlags.length) {
-    contentEl.innerHTML = '<div class="empty">No flagged cards right now 🎉</div>';
+    contentEl.innerHTML = bannerHtml + '<div class="empty">No flagged cards right now 🎉</div>';
   } else {
     const byPo = groupFlags(lastFlags);
     let html = "";
@@ -233,7 +254,7 @@ function render(data) {
       }
       html += `</div>`;
     }
-    contentEl.innerHTML = html;
+    contentEl.innerHTML = bannerHtml + html;
 
     document.querySelectorAll(".copyPoBtn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -260,11 +281,12 @@ function render(data) {
   }
   if (data.scanned && data.scanned.length) {
     extra += `<details class="scanlist"><summary>Full scan results — every active client checked (${data.scanned.length})</summary>`;
-    extra += `<table class="scan-table"><thead><tr><th class="icon"></th><th>Client</th><th>PO</th><th>Cards checked</th><th>Flagged</th><th>Notes</th></tr></thead><tbody>`;
+    extra += `<table class="scan-table"><thead><tr><th class="icon"></th><th>Client</th><th>PO</th><th>Review window</th><th>Cards checked</th><th>Flagged</th><th>Notes</th></tr></thead><tbody>`;
     data.scanned.forEach((s) => {
       const icon = s.error ? "❌" : s.flaggedCount > 0 ? "⚠️" : "✅";
       const rowClass = s.error ? "row-error" : s.flaggedCount > 0 ? "row-flagged" : "";
-      extra += `<tr class="${rowClass}"><td class="icon">${icon}</td><td>${s.client}</td><td>${s.po}</td><td>${s.cardsChecked}</td><td>${s.flaggedCount}</td><td>${s.error || ""}</td></tr>`;
+      const cadenceCell = s.cadenceSource ? s.cadenceSource.replace(/^sheet:/, "📋 sheet:").replace(/^default/, "🔹 default") : "—";
+      extra += `<tr class="${rowClass}"><td class="icon">${icon}</td><td>${s.client}</td><td>${s.po}</td><td>${cadenceCell}</td><td>${s.cardsChecked}</td><td>${s.flaggedCount}</td><td>${s.error || ""}</td></tr>`;
     });
     extra += `</tbody></table></details>`;
   }
