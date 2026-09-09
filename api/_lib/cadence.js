@@ -5,32 +5,85 @@
 // column into a number of days-before-publish the pace rule should use for
 // that client, instead of the flat 24hr default everyone used before.
 //
-// Requires GOOGLE_SHEETS_API_KEY env var (a Google Cloud API key restricted
-// to the Sheets API - no OAuth/service account needed). The sheet itself
-// must be shared as "Anyone with the link -> Viewer" for a plain API key to
-// read it. If the key is missing, or the sheet can't be reached, every
-// client just falls back to the default lead time - nothing breaks, it just
-// behaves exactly like it did before this feature existed.
-//
-// File prefixed with "_" so Vercel does NOT turn this into its own route -
-// it's a plain helper module required by api/flags.js.
+// No Google Cloud API key or service account needed. This reads the sheet
+// through Google's public CSV export endpoint (the same mechanism behind
+// "File -> Share -> Publish to web", just addressed directly by sheet name
+// instead of needing to actually publish it), which works for any sheet
+// shared as "Anyone with the link -> Viewer" - already set up on this sheet.
+// If the sheet's sharing is ever locked back down to "Restricted," this will
+// start failing and every client just falls back to the default lead time -
+// nothing breaks, cadenceStatus.connected will just read false and the
+// dashboard banner will say why.
 
 const DEFAULT_LEAD_DAYS = 1; // matches the original flat 24hr rule
 const CADENCE_SHEET_ID_DEFAULT = "1EKjDPil1iwEd_AlGLaIDQpUIpCSjHjUyn7OSheNpFLg";
 const CADENCE_SHEET_TAB_DEFAULT = "Template";
 
-async function fetchSheetRows(apiKey, sheetId, tabName) {
-  const range = encodeURIComponent(`${tabName}!A:J`);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${range}?key=${apiKey}`;
-  const resp = await fetch(url);
+function csvUrl(sheetId, tabName) {
+  return `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
+}
+
+// Minimal CSV parser - handles quoted fields, escaped quotes (""), and
+// commas/newlines inside quotes. Good enough for a Sheets CSV export.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function fetchSheetRows(sheetId, tabName) {
+  const resp = await fetch(csvUrl(sheetId, tabName));
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    const err = new Error(`Google Sheets fetch failed (${resp.status}): ${text.slice(0, 300)}`);
+    const err = new Error(
+      `Couldn't read the cadence sheet (${resp.status}). Make sure it's shared as "Anyone with the link -> Viewer". ${text.slice(0, 200)}`
+    );
     err.status = resp.status;
     throw err;
   }
-  const data = await resp.json();
-  return data.values || [];
+  const text = await resp.text();
+  const rows = parseCsv(text);
+  // A sheet that's NOT link-shared returns a 200 with an HTML sign-in page
+  // instead of CSV - detect that so it shows up as a clear error, not
+  // silently as "0 rows found."
+  if (rows.length && rows[0].some((c) => /<html|accounts\.google\.com/i.test(c || ""))) {
+    throw new Error(`Got an HTML sign-in page instead of CSV - the sheet isn't shared as "Anyone with the link" yet.`);
+  }
+  return rows;
 }
 
 // "2 days before each scheduled post date" -> 2, "a day before posting" -> 1,
@@ -97,19 +150,11 @@ function parseCadenceRows(rows) {
 }
 
 async function getCadenceMap() {
-  const apiKey = process.env.GOOGLE_SHEETS_API_KEY;
   const sheetId = process.env.CADENCE_SHEET_ID || CADENCE_SHEET_ID_DEFAULT;
   const tabName = process.env.CADENCE_SHEET_TAB || CADENCE_SHEET_TAB_DEFAULT;
 
-  if (!apiKey) {
-    return {
-      map: new Map(),
-      ok: false,
-      error: "GOOGLE_SHEETS_API_KEY not set - every client is using the default lead time.",
-    };
-  }
   try {
-    const rows = await fetchSheetRows(apiKey, sheetId, tabName);
+    const rows = await fetchSheetRows(sheetId, tabName);
     const { map, headerFound, rowCount } = parseCadenceRows(rows);
     if (!headerFound) {
       return { map: new Map(), ok: false, error: `Couldn't find a "Client Name" header on the "${tabName}" tab.` };
