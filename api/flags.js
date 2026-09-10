@@ -2,7 +2,9 @@
 //
 // Scans every active client's Content Board (via the Project Tracker) and
 // flags cards that are behind pace - i.e. not ready for client review by
-// each client's own required lead time before their Publish Date.
+// each client's own required lead time before their Publish Date. Checks
+// both upcoming cards AND cards already overdue (Publish Date passed) in
+// the last LOOKBACK_DAYS that are still stuck in an unfinished status.
 //
 // That lead time comes from the "Client Posting Cadence & Non-Negotiables"
 // Google Sheet POs fill in (see api/_lib/cadence.js) - a client with a row
@@ -10,18 +12,16 @@
 // or an unparseable one, falls back to the original flat 24hr rule.
 //
 // Env vars required (set in Vercel Project Settings -> Environment Variables):
-//   NOTION_TOKEN         - same Notion integration token used by the other
-//                          Editoz dashboards. It must be shared with the
-//                          Project Tracker AND with every client's Content
-//                          Board page (Notion integrations only see pages
-//                          explicitly shared with them - share the client's
-//                          "Content Production Engine" page and the Content
-//                          Board underneath it is covered too).
-//   GOOGLE_SHEETS_API_KEY - a Google Cloud API key restricted to the Sheets
-//                          API, used to read the cadence sheet. Optional -
-//                          if unset, every client just uses the flat 24hr
-//                          default (nothing breaks, cadenceStatus.connected
-//                          will just read false in the response).
+//   NOTION_TOKEN  - same Notion integration token used by the other Editoz
+//                   dashboards. It must be shared with the Project Tracker
+//                   AND with every client's Content Board page (Notion
+//                   integrations only see pages explicitly shared with them
+//                   - share the client's "Content Production Engine" page
+//                   and the Content Board underneath it is covered too).
+//
+// The cadence sheet (api/_lib/cadence.js) needs no env var or Google Cloud
+// setup at all - it just needs the sheet shared as "Anyone with the link ->
+// Viewer," which reads via Google's public CSV export.
 //
 // Optional query params:
 //   ?client=Kavindu   - only scan clients whose name contains this text (case-insensitive)
@@ -68,6 +68,13 @@ const EARLY_STAGE_MATCH = new Set([
 ]);
 
 const EXCLUDED_CLIENT_STAGES = new Set(["On Hold", "Offboarded"]);
+
+// How many days into the past to also check for cards that are already
+// overdue (Publish Date passed) and still not in a "done" status - not just
+// upcoming ones. Anything overdue by more than this is assumed to already
+// be a known/escalated issue rather than something this scan needs to keep
+// re-surfacing every time.
+const LOOKBACK_DAYS = 7;
 
 async function notionGet(token, path) {
   const resp = await fetch(`https://api.notion.com${path}`, {
@@ -245,10 +252,19 @@ module.exports = async (req, res) => {
       .map((c) => ({ client: c.clientName, reason: "No Content Board Data Source ID set in Project Tracker" }));
     clients = clients.filter((c) => c.contentBoardDsId);
 
-    // 2. Scan each client's Content Board for upcoming cards
+    // 2. Scan each client's Content Board for upcoming AND recently-overdue
+    // cards. Without a lookback window, a card whose Publish Date already
+    // passed and is still stuck in an unfinished status would silently fall
+    // outside the query and never get flagged anywhere - looking back
+    // LOOKBACK_DAYS catches those without scanning a board's entire history
+    // (which would mostly just be old Published cards getting re-fetched
+    // and filtered back out on every single scan).
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     const todayStr = isoDateOnly(today);
+    const windowStart = new Date(today);
+    windowStart.setUTCDate(windowStart.getUTCDate() - LOOKBACK_DAYS);
+    const windowStartStr = isoDateOnly(windowStart);
     const windowEnd = new Date(today);
     windowEnd.setUTCDate(windowEnd.getUTCDate() + windowDays);
     const windowEndStr = isoDateOnly(windowEnd);
@@ -286,7 +302,7 @@ module.exports = async (req, res) => {
         const cards = await queryAllPages(token, client.contentBoardDsId, {
           filter: {
             and: [
-              { property: dateProp, date: { on_or_after: todayStr } },
+              { property: dateProp, date: { on_or_after: windowStartStr } },
               { property: dateProp, date: { on_or_before: windowEndStr } },
             ],
           },
@@ -307,11 +323,17 @@ module.exports = async (req, res) => {
             (new Date(publishDate + "T00:00:00Z") - new Date(todayStr + "T00:00:00Z")) / 86400000
           );
 
+          // "segment" is the display bucket - a finer split than "flag"
+          // (hard/soft) so overdue cards land in their own section instead
+          // of being mixed in with cards that are merely due today/soon.
           let flag = null;
+          let segment = null;
           if (daysUntil <= leadDays) {
             flag = "hard";
+            segment = daysUntil < 0 ? "overdue" : "behind_pace";
           } else if (EARLY_STAGE_MATCH.has(statusKey)) {
             flag = "soft";
+            segment = "heads_up";
           }
 
           if (flag) {
@@ -327,6 +349,7 @@ module.exports = async (req, res) => {
               leadDays,
               cadenceSource,
               flag,
+              segment,
             });
           }
         }
@@ -356,8 +379,10 @@ module.exports = async (req, res) => {
 
     scanned.sort((a, b) => a.client.localeCompare(b.client));
 
+    const SEGMENT_ORDER = { overdue: 0, behind_pace: 1, heads_up: 2 };
     flags.sort((a, b) => {
-      if (a.flag !== b.flag) return a.flag === "hard" ? -1 : 1;
+      const order = SEGMENT_ORDER[a.segment] - SEGMENT_ORDER[b.segment];
+      if (order !== 0) return order;
       return a.publishDate.localeCompare(b.publishDate);
     });
 
@@ -365,6 +390,7 @@ module.exports = async (req, res) => {
       generatedAt: new Date().toISOString(),
       today: todayStr,
       windowDays,
+      lookbackDays: LOOKBACK_DAYS,
       clientsScanned: clients.length,
       flags,
       skipped,
