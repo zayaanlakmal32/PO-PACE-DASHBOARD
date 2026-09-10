@@ -178,7 +178,11 @@ function cardLine(f, forSlack) {
   const deadline = new Date(new Date(f.publishDate + "T00:00:00Z").getTime() - leadDays * 86400000).toISOString().slice(0, 10);
   const windowLabel = `${leadDays}-day review window`;
   let when, note;
-  if (f.daysUntil <= 0) {
+  if (f.daysUntil < 0) {
+    const daysOverdue = Math.abs(f.daysUntil);
+    when = `was due ${daysOverdue} day${daysOverdue === 1 ? "" : "s"} ago (${fmtDate(f.publishDate)})`;
+    note = `still "${f.status}" — overdue, should've been ready for client review by ${fmtDate(deadline)} (${windowLabel})`;
+  } else if (f.daysUntil === 0) {
     when = `publishes today (${fmtDate(f.publishDate)})`;
     note = `still "${f.status}" (should've been ready for client review by ${fmtDate(deadline)} — ${windowLabel})`;
   } else if (f.daysUntil <= leadDays) {
@@ -230,7 +234,8 @@ function cadenceBanner(status) {
 
 function render(data) {
   lastFlags = data.flags || [];
-  metaEl.textContent = `generated ${new Date(data.generatedAt).toLocaleString()} · scanned ${data.clientsScanned} active client(s) · window ${data.windowDays}d`;
+  const lookback = data.lookbackDays != null ? ` · lookback ${data.lookbackDays}d` : "";
+  metaEl.textContent = `generated ${new Date(data.generatedAt).toLocaleString()} · scanned ${data.clientsScanned} active client(s) · lookahead ${data.windowDays}d${lookback}`;
 
   const bannerHtml = cadenceBanner(data.cadenceStatus);
 
