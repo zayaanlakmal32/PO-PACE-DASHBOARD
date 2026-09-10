@@ -141,6 +141,18 @@
   }
   .cadence-ok { color: var(--ok); border-color: #24422c; background: #12291a; }
   .cadence-off { color: var(--soft); border-color: #4a3c14; background: #241d0c; }
+  .segment-label {
+    font-size: 11.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    margin-top: 10px;
+    margin-bottom: 2px;
+    color: var(--muted);
+  }
+  .segment-label.segment-overdue { color: var(--hard); }
+  .segment-label.segment-behind_pace { color: var(--hard); opacity: 0.85; }
+  .segment-label.segment-heads_up { color: var(--soft); }
 </style>
 </head>
 <body>
@@ -153,6 +165,7 @@
 <div class="toolbar">
   <button class="primary" id="refreshBtn">Refresh</button>
   <button id="copyAllBtn">Copy full list for Slack</button>
+  <button id="copyContentFlagBtn">Copy CONTENT FLAG list</button>
   <label class="meta">Test single client (matches any part of the name): <input type="text" id="clientFilter" placeholder="e.g. lori" size="14"/></label>
   <label class="meta">Lookahead days: <input type="number" id="daysInput" value="5" min="1" max="14" size="3"/></label>
 </div>
@@ -165,6 +178,7 @@ const contentEl = document.getElementById("content");
 const statusEl = document.getElementById("status");
 const metaEl = document.getElementById("meta");
 let lastFlags = [];
+let lastTodayStr = null;
 
 function fmtDate(dateStr) {
   const d = new Date(dateStr + "T00:00:00Z");
@@ -172,27 +186,34 @@ function fmtDate(dateStr) {
 }
 
 function cardLine(f, forSlack) {
-  const icon = f.flag === "hard" ? "⚠️" : "👀";
+  // Overdue gets its own red-circle icon so it never reads the same as a
+  // card that's merely due today (⚠️) - that mix-up was the original ask.
+  const icon = f.segment === "overdue" ? "🔴" : f.flag === "hard" ? "⚠️" : "👀";
   const link = forSlack ? `<${f.cardUrl}|${f.cardName}>` : `<a href="${f.cardUrl}" target="_blank" rel="noopener">${f.cardName}</a>`;
   const leadDays = f.leadDays == null ? 1 : f.leadDays;
   const deadline = new Date(new Date(f.publishDate + "T00:00:00Z").getTime() - leadDays * 86400000).toISOString().slice(0, 10);
   const windowLabel = `${leadDays}-day review window`;
-  let when, note;
+
+  let publishWhen;
   if (f.daysUntil < 0) {
-    const daysOverdue = Math.abs(f.daysUntil);
-    when = `was due ${daysOverdue} day${daysOverdue === 1 ? "" : "s"} ago (${fmtDate(f.publishDate)})`;
-    note = `still "${f.status}" — overdue, should've been ready for client review by ${fmtDate(deadline)} (${windowLabel})`;
+    const daysAgo = Math.abs(f.daysUntil);
+    publishWhen = `published ${daysAgo} day${daysAgo === 1 ? "" : "s"} ago (${fmtDate(f.publishDate)})`;
   } else if (f.daysUntil === 0) {
-    when = `publishes today (${fmtDate(f.publishDate)})`;
-    note = `still "${f.status}" (should've been ready for client review by ${fmtDate(deadline)} — ${windowLabel})`;
-  } else if (f.daysUntil <= leadDays) {
-    when = `publishes ${fmtDate(f.publishDate)}`;
-    note = `still "${f.status}" (should be ready for client review as of today — ${windowLabel})`;
+    publishWhen = `publishes today (${fmtDate(f.publishDate)})`;
   } else {
-    when = `publishes ${fmtDate(f.publishDate)}`;
+    publishWhen = `publishes ${fmtDate(f.publishDate)}`;
+  }
+
+  let note;
+  if (f.segment === "overdue") {
+    const daysLate = leadDays - f.daysUntil;
+    note = `still "${f.status}" — review deadline missed by ${daysLate} day${daysLate === 1 ? "" : "s"} (was due ${fmtDate(deadline)}), ${publishWhen}`;
+  } else if (f.segment === "behind_pace") {
+    note = `still "${f.status}" — review due today (${windowLabel}), ${publishWhen}`;
+  } else {
     note = `still "${f.status}" — heads-up, behind pace, follow up to speed up`;
   }
-  return `${icon} ${link} — ${when}, ${note}`;
+  return `${icon} ${link} — ${note}`;
 }
 
 function groupFlags(flags) {
@@ -205,6 +226,25 @@ function groupFlags(flags) {
   return byPo;
 }
 
+// Segments, in display order. A card lands in "overdue" the moment its
+// review DEADLINE (publishDate - leadDays) has passed - kept separate from
+// "behind_pace" (review due today, not yet late) per how this dashboard
+// should read.
+const SEGMENTS = [
+  { key: "overdue", label: "🔴 CRITICAL — review deadline missed" },
+  { key: "behind_pace", label: "⚠️ HIGH — review due today" },
+  { key: "heads_up", label: "👀 Heads-up" },
+];
+
+function splitBySegment(cardFlags) {
+  const bySegment = {};
+  for (const seg of SEGMENTS) bySegment[seg.key] = [];
+  for (const f of cardFlags) {
+    (bySegment[f.segment] || (bySegment[f.segment] = [])).push(f);
+  }
+  return bySegment;
+}
+
 function buildSlackText(byPo, poFilter) {
   const lines = [];
   const poNames = poFilter ? [poFilter] : Object.keys(byPo).sort();
@@ -215,11 +255,106 @@ function buildSlackText(byPo, poFilter) {
     for (const client of Object.keys(clients)) {
       lines.push(`Client: ${client}`);
       lines.push("");
-      for (const f of clients[client]) {
-        lines.push(`• ${cardLine(f, true)}`);
+      const bySegment = splitBySegment(clients[client]);
+      for (const seg of SEGMENTS) {
+        const items = bySegment[seg.key];
+        if (!items || !items.length) continue;
+        lines.push(`*${seg.label}*`);
+        for (const f of items) {
+          lines.push(`• ${cardLine(f, true)}`);
+        }
+        lines.push("");
       }
-      lines.push("");
     }
+  }
+  return lines.join("\n").trim();
+}
+
+// PO Name (as it appears in the Project Tracker "PO Name" field) -> Slack
+// member ID, so the CONTENT FLAG list below can generate real, notifying
+// @mentions (Slack's <@USERID> syntax) instead of plain "@Name" text that
+// wouldn't actually ping anyone. Keys are matched case-insensitively.
+// Add a PO here the moment you have their ID - anyone not listed still
+// shows up (as plain "@Name (no Slack ID on file)") instead of silently
+// disappearing from the list.
+const PO_SLACK_IDS = {
+  "abilasha sivakumar": "U0AK5BH2E85",
+  "ashen": "U09MEPNH39P",
+  "eshan madushka": "U0A154ZAVUK",
+  "himaza zahara": "U0BSN3W0GPL",
+  "himaya": "U0C0PAG8JKW",
+  "mahima passela": "U0B4CKFJ1B3",
+  "nithila": "U0B5238F74K",
+  "rovidu": "U09A08362NP",
+  "ryan jacob": "U0BB3PQKZGD",
+  "tharumal": "U0BJGHFR6CW",
+  "vishma": "U07TE8ERQTA",
+  "dinith ranasinghe": "U0BT0P874LA",
+  "vishaka": "U0AA545PXML",
+  "danush": "U0AK5Q8R33K",
+  "jithya": "U0BS95JU8R1",
+};
+
+function poMention(poName) {
+  const id = PO_SLACK_IDS[(poName || "").trim().toLowerCase()];
+  return id ? `<@${id}>` : `@${poName} (no Slack ID on file)`;
+}
+
+function ordinal(n) {
+  const rem100 = n % 100;
+  if (rem100 >= 11 && rem100 <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1: return `${n}st`;
+    case 2: return `${n}nd`;
+    case 3: return `${n}rd`;
+    default: return `${n}th`;
+  }
+}
+
+// "Sept" not the usual 3-letter "Sep" - matches how you actually write it
+// ("CONTENT FLAG - 9TH SEPT").
+const MONTH_ABBR = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEPT", "OCT", "NOV", "DEC"];
+
+function contentFlagDateLabel(todayStr) {
+  const d = new Date(todayStr + "T00:00:00Z");
+  const day = ordinal(d.getUTCDate()).toUpperCase();
+  const month = MONTH_ABBR[d.getUTCMonth()];
+  return `${day} ${month}`;
+}
+
+// Builds the roster-style "CONTENT FLAG" list you post for Sayuni: just
+// CRITICAL (overdue) and HIGH (due today) buckets, each PO-client pair
+// listed once even if that client has several flagged cards - it's meant
+// to answer "who/what needs attention," not repeat every card.
+function buildContentFlagText(flags, todayStr) {
+  const buckets = {
+    overdue: new Map(), // "po|||client" -> {po, client}
+    behind_pace: new Map(),
+  };
+  for (const f of flags) {
+    const bucket = buckets[f.segment];
+    if (!bucket) continue;
+    const key = `${f.po}|||${f.client}`;
+    if (!bucket.has(key)) bucket.set(key, { po: f.po, client: f.client });
+  }
+
+  function sortedPairs(map) {
+    return Array.from(map.values()).sort((a, b) => a.po.localeCompare(b.po) || a.client.localeCompare(b.client));
+  }
+
+  const lines = [];
+  lines.push(`*CONTENT FLAG - ${contentFlagDateLabel(todayStr)}*`);
+  lines.push("");
+  lines.push(`🔴 *CRITICAL - client review deadline already missed, still not ready*`);
+  lines.push("");
+  for (const { po, client } of sortedPairs(buckets.overdue)) {
+    lines.push(`${poMention(po)} - ${client}`);
+  }
+  lines.push("");
+  lines.push(`🟠 *HIGH - client review is due today, still not ready*`);
+  lines.push("");
+  for (const { po, client } of sortedPairs(buckets.behind_pace)) {
+    lines.push(`${poMention(po)} - ${client}`);
   }
   return lines.join("\n").trim();
 }
@@ -234,6 +369,7 @@ function cadenceBanner(status) {
 
 function render(data) {
   lastFlags = data.flags || [];
+  lastTodayStr = data.today || null;
   const lookback = data.lookbackDays != null ? ` · lookback ${data.lookbackDays}d` : "";
   metaEl.textContent = `generated ${new Date(data.generatedAt).toLocaleString()} · scanned ${data.clientsScanned} active client(s) · lookahead ${data.windowDays}d${lookback}`;
 
@@ -251,11 +387,18 @@ function render(data) {
       html += `<div class="po-header"><span class="po-name">${po}</span>`;
       html += `<span><span class="po-count">${total} flagged</span> <button class="copyPoBtn" data-po="${po}">Copy</button></span></div>`;
       for (const client of Object.keys(clients)) {
-        html += `<div class="client-block"><div class="client-name">Client: ${client}</div><ul class="cards">`;
-        for (const f of clients[client]) {
-          html += `<li class="card flag-${f.flag}">${cardLine(f, false)} <span class="status-tag">${f.status}</span></li>`;
+        html += `<div class="client-block"><div class="client-name">Client: ${client}</div>`;
+        const bySegment = splitBySegment(clients[client]);
+        for (const seg of SEGMENTS) {
+          const items = bySegment[seg.key];
+          if (!items || !items.length) continue;
+          html += `<div class="segment-label segment-${seg.key}">${seg.label} (${items.length})</div><ul class="cards">`;
+          for (const f of items) {
+            html += `<li class="card flag-${f.flag}">${cardLine(f, false)} <span class="status-tag">${f.status}</span></li>`;
+          }
+          html += `</ul>`;
         }
-        html += `</ul></div>`;
+        html += `</div>`;
       }
       html += `</div>`;
     }
@@ -275,7 +418,7 @@ function render(data) {
 
   let extra = "";
   if (data.skipped && data.skipped.length) {
-    extra += `<details class="skipped"><summary>${data.skipped.length} client(s) skipped (no Content Board Data Source ID)</summary><ul>`;
+    extra += `<details class="skipped"><summary>${data.skipped.length} client(s) skipped (no Content Board Data Source ID)<ul>`;
     data.skipped.forEach((s) => (extra += `<li>${s.client} — ${s.reason}</li>`));
     extra += `</ul></details>`;
   }
@@ -325,6 +468,15 @@ document.getElementById("copyAllBtn").addEventListener("click", () => {
     const btn = document.getElementById("copyAllBtn");
     btn.textContent = "Copied!";
     setTimeout(() => (btn.textContent = "Copy full list for Slack"), 1200);
+  });
+});
+document.getElementById("copyContentFlagBtn").addEventListener("click", () => {
+  const todayStr = lastTodayStr || new Date().toISOString().slice(0, 10);
+  const text = buildContentFlagText(lastFlags, todayStr);
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById("copyContentFlagBtn");
+    btn.textContent = "Copied!";
+    setTimeout(() => (btn.textContent = "Copy CONTENT FLAG list"), 1200);
   });
 });
 
