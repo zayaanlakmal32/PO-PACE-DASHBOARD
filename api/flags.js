@@ -67,7 +67,7 @@ const EARLY_STAGE_MATCH = new Set([
   "ready to film",
 ]);
 
-const EXCLUDED_CLIENT_STAGES = new Set(["On Hold", "Offboarded"]);
+const EXCLUDED_CLIENT_STAGES = new Set(["On Hold", "Offboarded", "Not Started"]);
 
 // How many days into the past to also check for cards that are already
 // overdue (Publish Date passed) and still not in a "done" status - not just
@@ -325,12 +325,18 @@ module.exports = async (req, res) => {
 
           // "segment" is the display bucket - a finer split than "flag"
           // (hard/soft) so overdue cards land in their own section instead
-          // of being mixed in with cards that are merely due today/soon.
+          // of being mixed in with cards that are merely due today.
+          //
+          // "Overdue" means the REVIEW DEADLINE (publishDate - leadDays) has
+          // already passed as of today - i.e. daysUntil < leadDays. This is
+          // NOT the same as "the publish date itself has passed": for a
+          // client with a 2-day review window, a card publishing tomorrow
+          // can already be overdue for review (its deadline was yesterday).
           let flag = null;
           let segment = null;
           if (daysUntil <= leadDays) {
             flag = "hard";
-            segment = daysUntil < 0 ? "overdue" : "behind_pace";
+            segment = daysUntil < leadDays ? "overdue" : "behind_pace";
           } else if (EARLY_STAGE_MATCH.has(statusKey)) {
             flag = "soft";
             segment = "heads_up";
