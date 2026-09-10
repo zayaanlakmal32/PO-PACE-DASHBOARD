@@ -457,4 +457,38 @@ async function load() {
     render(data);
   } catch (e) {
     statusEl.textContent = "";
-    contentEl.innerHTML = `<div
+    contentEl.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+document.getElementById("refreshBtn").addEventListener("click", load);
+// Hitting Enter in either box re-runs the scan with that value, same as
+// clicking Refresh - typing alone never filtered anything before this.
+["clientFilter", "daysInput"].forEach((id) => {
+  document.getElementById(id).addEventListener("keydown", (e) => {
+    if (e.key === "Enter") load();
+  });
+});
+document.getElementById("copyAllBtn").addEventListener("click", () => {
+  const text = buildSlackText(groupFlags(lastFlags));
+  navigator.clipboard.writeText(text || "Nothing flagged right now.").then(() => {
+    const btn = document.getElementById("copyAllBtn");
+    btn.textContent = "Copied!";
+    setTimeout(() => (btn.textContent = "Copy full list for Slack"), 1200);
+  });
+});
+document.getElementById("copyContentFlagBtn").addEventListener("click", () => {
+  const todayStr = lastTodayStr || new Date().toISOString().slice(0, 10);
+  const text = buildContentFlagText(lastFlags, todayStr);
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.getElementById("copyContentFlagBtn");
+    btn.textContent = "Copied!";
+    setTimeout(() => (btn.textContent = "Copy CONTENT FLAG list"), 1200);
+  });
+});
+
+load();
+</script>
+
+</body>
+</html>
